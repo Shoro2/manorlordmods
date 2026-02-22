@@ -108,8 +108,22 @@ end
 -- =========================
 -- Type detection
 -- =========================
+
+-- ENodeType enum (uint32): maps integer value -> canonical name
+-- From ENodeType.h: None=0, Salt=1, Iron=2, Clay=3, Deer=4, Fish=5,
+--                   Berries=6, Stone=7, Ladders=8, Mushrooms=9,
+--                   SmallGame=10, Eel=11, Fertility=12
+local ENODE_INT_TO_NAME = {
+    [1] = "Salt", [2] = "Iron", [3] = "Clay", [4] = "Deer",
+    [5] = "Fish", [6] = "Berries", [7] = "Stone", [10] = "SmallGame",
+}
+
 local function canonical_from_name(name)
     local s = safe_lower(tostring(name))
+    -- try integer enum value first
+    local n = tonumber(s)
+    if n ~= nil then return ENODE_INT_TO_NAME[n] end
+    -- substring matching for FName / class name strings
     if s:find("stone", 1, true) then return "Stone" end
     if s:find("clay", 1, true) then return "Clay" end
     if s:find("salt", 1, true) then return "Salt" end
@@ -169,19 +183,22 @@ end
 local function patch_deposit_decal(a)
     local t = canonical_from_depositType(try_get(a, "depositType"))
     if not t or not TARGETS[t] then return false end
-    if not TARGETS[t].rich then return false end -- nur Mineables rich machen
 
     local amt = TARGETS[t].amount
     local changed = false
 
+    -- Limit patchen für ALLE Deposit-Typen (nicht nur Rich)
     local cur = to_num(try_get(a, "Limit"))
     if cur ~= nil and cur ~= amt then
         if try_set(a, "Limit", amt) then changed = true end
     end
 
-    local br = try_get(a, "bRichDeposit")
-    if type(br) == "boolean" and br ~= true then
-        if try_set(a, "bRichDeposit", true) then changed = true end
+    -- bRichDeposit nur für Mineables (Salt, Iron, Clay, Stone)
+    if TARGETS[t].rich then
+        local br = try_get(a, "bRichDeposit")
+        if type(br) == "boolean" and br ~= true then
+            if try_set(a, "bRichDeposit", true) then changed = true end
+        end
     end
 
     return changed
@@ -254,7 +271,7 @@ local function patch_resource_settings()
         local entry = tarray_get(data, i0)
         if entry ~= nil then
             local t = canonical_from_name(try_get(entry, "Type"))
-            -- entry.Type ist Enum; tostring enthält meist "Stone" etc., canonical_from_name reicht.
+            -- entry.Type ist ENodeType Enum; kann als int (1=Salt...) oder String kommen
             if t and TARGETS[t] then
                 local props = try_get(entry, "Properties")
                 if props ~= nil then
@@ -269,10 +286,18 @@ local function patch_resource_settings()
                     try_set(props, "MinRichResourceAmount", amt)
                     try_set(props, "MaxRichResourceAmount", amt)
 
+                    -- resourceCount: wie viele Clumps spawnen
+                    try_set(props, "resourceCount", amt)
+
                     -- Mineables: underground deposits when rich
                     if rich then
                         try_set(props, "bIsLimitedResource", true)
                         try_set(props, "bUndergroundDepositsWhenRich", true)
+                    end
+
+                    -- Tiere: BreedingThreshold niedrig setzen -> schneller vermehren
+                    if t == "Deer" or t == "SmallGame" then
+                        try_set(props, "BreedingThreshold", 1)
                     end
 
                     patched = patched + 1
