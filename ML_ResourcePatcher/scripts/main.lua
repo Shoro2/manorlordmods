@@ -18,6 +18,7 @@ local CFG = {
     START_DELAY_PASSES = 2, -- erst ab Pass X anfangen (reduziert Race/CTD-Risiko)
     DEBUG_SAMPLES = 12,
     DEBUG_UNMATCHED = true,  -- zeigt nicht erkannte Ressourcen/Deposits (Diagnose)
+    DEBUG_FULL_SCAN = true,  -- listet ALLE gescannten Objekte mit Properties auf (einmal pro Map)
 }
 
 -- =========================
@@ -31,6 +32,7 @@ local TARGETS = {
 
     Fish      = { amount = 999,  rich = false },
     Berries   = { amount = 999,  rich = false },
+    Mushrooms = { amount = 999,  rich = false },
     -- Wildtiere: amount wirkt nur auf ResourceSettings (Spawn-Parameter),
     -- da Tiere ASMUnit-Aktoren sind, nicht AResource.
     Deer      = { amount = 999,  rich = false, wildlife = true },
@@ -125,7 +127,8 @@ end
 --                   SmallGame=10, Eel=11, Fertility=12
 local ENODE_INT_TO_NAME = {
     [1] = "Salt", [2] = "Iron", [3] = "Clay", [4] = "Deer",
-    [5] = "Fish", [6] = "Berries", [7] = "Stone", [10] = "SmallGame",
+    [5] = "Fish", [6] = "Berries", [7] = "Stone", [9] = "Mushrooms",
+    [10] = "SmallGame",
 }
 
 -- EItemType enum (uint32): Fallback falls AResource.Type EItemType statt ENodeType ist
@@ -159,6 +162,7 @@ local function canonical_from_name(name)
     if s:find("berries", 1, true) or s:find("berry", 1, true) then return "Berries" end
     if s:find("deer", 1, true) or s:find("stag", 1, true) then return "Deer" end
     if s:find("smallgame", 1, true) or s:find("small_game", 1, true) then return "SmallGame" end
+    if s:find("mushroom", 1, true) or s:find("pilz", 1, true) then return "Mushrooms" end
     return nil
 end
 
@@ -437,6 +441,208 @@ local function log_unmatched_deposit(a)
 end
 
 -- =========================
+-- Debug: vollständiger Scan aller Objekte (einmal pro Map)
+-- =========================
+local fullScanDone = false
+
+local function debug_full_scan()
+    if not CFG.DEBUG_FULL_SCAN then return end
+
+    print(TAG .. "========== FULL SCAN START ==========")
+
+    -- 1) AResource Aktoren
+    print(TAG .. "--- AResource Aktoren ---")
+    local resources = FindAllOf("Resource")
+    if resources then
+        local count = 0
+        for _, a in ipairs(resources) do
+            if a and a.IsValid and a:IsValid() and is_level_instance(a) then
+                count = count + 1
+                local resType   = tostring(try_get(a, "resType") or "?")
+                local typeInt   = tostring(try_get(a, "Type") or "?")
+                local dispName  = tostring(try_get(a, "DisplayName") or "?")
+                local amt       = tostring(try_get(a, "amt") or "?")
+                local capacity  = tostring(try_get(a, "capacity") or "?")
+                local cls = "?"
+                pcall(function() cls = tostring(a:GetClass():GetFName():ToString()) end)
+                local matched = canonical_from_name(try_get(a, "resType"))
+                    or canonical_from_name(try_get(a, "Type"))
+                    or canonical_from_name(try_get(a, "DisplayName"))
+                    or "NO_MATCH"
+                print(TAG .. ("  [%d] class=%s | resType=%s | Type=%s | DisplayName=%s | amt=%s | capacity=%s | => %s")
+                    :format(count, cls, resType, typeInt, dispName, amt, capacity, matched))
+            end
+        end
+        print(TAG .. "  AResource total (level instances): " .. count)
+    else
+        print(TAG .. "  FindAllOf('Resource') returned nil")
+    end
+
+    -- 2) ADepositDecal Aktoren
+    print(TAG .. "--- ADepositDecal Aktoren ---")
+    local deposits = FindAllOf("DepositDecal")
+    if deposits then
+        local count = 0
+        for _, a in ipairs(deposits) do
+            if a and a.IsValid and a:IsValid() and is_level_instance(a) then
+                count = count + 1
+                local depType = tostring(try_get(a, "depositType") or "?")
+                local limit   = tostring(try_get(a, "Limit") or "?")
+                local rich    = tostring(try_get(a, "bRichDeposit") or "?")
+                local cls = "?"
+                pcall(function() cls = tostring(a:GetClass():GetFName():ToString()) end)
+                -- depositedGood.Type auslesen
+                local goodType = "?"
+                local good = try_get(a, "depositedGood")
+                if good then
+                    goodType = tostring(try_get(good, "Type") or "?")
+                end
+                local matched = canonical_from_depositType(try_get(a, "depositType"))
+                if not matched and good then
+                    matched = canonical_from_name(try_get(good, "Type"))
+                end
+                matched = matched or "NO_MATCH"
+                print(TAG .. ("  [%d] class=%s | depositType=%s | goodType=%s | Limit=%s | bRichDeposit=%s | => %s")
+                    :format(count, cls, depType, goodType, limit, rich, matched))
+            end
+        end
+        print(TAG .. "  ADepositDecal total (level instances): " .. count)
+    else
+        print(TAG .. "  FindAllOf('DepositDecal') returned nil")
+    end
+
+    -- 3) ResourceNode Aktoren
+    print(TAG .. "--- ResourceNode Aktoren ---")
+    for _, className in ipairs({"ResourceNode", "BP_ResourceNode_C"}) do
+        local nodes = FindAllOf(className)
+        if nodes then
+            local count = 0
+            for _, n in ipairs(nodes) do
+                if n and n.IsValid and n:IsValid() and is_level_instance(n) then
+                    count = count + 1
+                    local cls = "?"
+                    pcall(function() cls = tostring(n:GetClass():GetFName():ToString()) end)
+                    -- alle bekannten Type-Felder auslesen
+                    local props = {}
+                    for _, k in ipairs({"nodeType", "NodeType", "Type", "depositType", "DepositType",
+                                        "bRichNode", "bRichDeposit", "bIsRich", "bRich", "bRichResource"}) do
+                        local v = try_get(n, k)
+                        if v ~= nil then
+                            props[#props+1] = k .. "=" .. tostring(v)
+                        end
+                    end
+                    local guessed = nil
+                    for _, k in ipairs({"nodeType", "NodeType", "Type", "depositType", "DepositType"}) do
+                        local v = try_get(n, k)
+                        local c = canonical_from_name(v)
+                        if c then guessed = c break end
+                    end
+                    print(TAG .. ("  [%d] source=%s | class=%s | %s | => %s")
+                        :format(count, className, cls,
+                            #props > 0 and table.concat(props, " | ") or "(keine Properties)",
+                            guessed or "NO_MATCH"))
+                end
+            end
+            print(TAG .. "  " .. className .. " total (level instances): " .. count)
+        else
+            print(TAG .. "  FindAllOf('" .. className .. "') returned nil")
+        end
+    end
+
+    -- 4) Wildlife / SMUnit Aktoren
+    print(TAG .. "--- SMUnit (Wildlife) Aktoren ---")
+    local units = FindAllOf("SMUnit")
+    if units then
+        local wildCount = 0
+        local totalUnits = 0
+        local roleSummary = {}
+        for _, u in ipairs(units) do
+            if u and u.IsValid and u:IsValid() and is_level_instance(u) then
+                totalUnits = totalUnits + 1
+                local curRole = try_get(u, "currentUnitRole")
+                local assignedRole = try_get(u, "assignedUnitRole")
+                local curRoleNum = tonumber(tostring(curRole or ""))
+                local assignedRoleNum = tonumber(tostring(assignedRole or ""))
+                local canonical = (curRoleNum and WILDLIFE_ROLES[curRoleNum])
+                    or (assignedRoleNum and WILDLIFE_ROLES[assignedRoleNum])
+                if canonical then
+                    wildCount = wildCount + 1
+                    local isDead = try_get(u, "dead")
+                    local preg = try_get(u, "pregnancy")
+                    -- Zusammenfassung pro Typ
+                    if not roleSummary[canonical] then
+                        roleSummary[canonical] = { alive = 0, dead = 0 }
+                    end
+                    if isDead == true then
+                        roleSummary[canonical].dead = roleSummary[canonical].dead + 1
+                    else
+                        roleSummary[canonical].alive = roleSummary[canonical].alive + 1
+                    end
+                    -- Erste paar pro Typ einzeln loggen
+                    if (roleSummary[canonical].alive + roleSummary[canonical].dead) <= 5 then
+                        print(TAG .. ("  wildlife: %s | curRole=%s | assignedRole=%s | dead=%s | pregnancy=%s")
+                            :format(canonical, tostring(curRoleNum), tostring(assignedRoleNum),
+                                tostring(isDead), tostring(preg)))
+                    end
+                end
+            end
+        end
+        -- Zusammenfassung
+        for name, s in pairs(roleSummary) do
+            print(TAG .. ("  Wildlife-Zusammenfassung: %s => alive=%d, dead=%d"):format(name, s.alive, s.dead))
+        end
+        if wildCount == 0 then
+            -- Dann die ersten 10 Units mit ihren Rollen loggen um zu sehen welche Rollen es gibt
+            print(TAG .. "  KEINE Wildlife erkannt! Erste 10 SMUnit-Rollen:")
+            local shown = 0
+            for _, u in ipairs(units) do
+                if u and u.IsValid and u:IsValid() and is_level_instance(u) and shown < 10 then
+                    shown = shown + 1
+                    local curRole = tostring(try_get(u, "currentUnitRole") or "?")
+                    local assignedRole = tostring(try_get(u, "assignedUnitRole") or "?")
+                    local cls = "?"
+                    pcall(function() cls = tostring(u:GetClass():GetFName():ToString()) end)
+                    print(TAG .. ("  [%d] class=%s | currentUnitRole=%s | assignedUnitRole=%s")
+                        :format(shown, cls, curRole, assignedRole))
+                end
+            end
+        end
+        print(TAG .. "  SMUnit total=" .. totalUnits .. " | wildlife erkannt=" .. wildCount)
+    else
+        print(TAG .. "  FindAllOf('SMUnit') returned nil")
+    end
+
+    -- 5) ResourceSettings dump
+    print(TAG .. "--- ResourceSettings ---")
+    local settings = find_resource_settings()
+    if settings then
+        local data = try_get(settings, "ResourceNodeData")
+        local len = data and tarray_num(data) or 0
+        print(TAG .. "  ResourceNodeData entries: " .. tostring(len))
+        if len and len > 0 then
+            for i0 = 0, len - 1 do
+                local entry = tarray_get(data, i0)
+                if entry then
+                    local entryType = tostring(try_get(entry, "Type") or "?")
+                    local canonical = canonical_from_name(try_get(entry, "Type")) or "NO_MATCH"
+                    local props = try_get(entry, "Properties")
+                    local minAmt = props and tostring(try_get(props, "MinResourceAmount") or "?") or "?"
+                    local maxAmt = props and tostring(try_get(props, "MaxResourceAmount") or "?") or "?"
+                    local minRich = props and tostring(try_get(props, "MinRichResourceAmount") or "?") or "?"
+                    local maxRich = props and tostring(try_get(props, "MaxRichResourceAmount") or "?") or "?"
+                    print(TAG .. ("  [%d] Type=%s | => %s | MinAmt=%s | MaxAmt=%s | MinRich=%s | MaxRich=%s")
+                        :format(i0, entryType, canonical, minAmt, maxAmt, minRich, maxRich))
+                end
+            end
+        end
+    else
+        print(TAG .. "  ResourceSettings NICHT gefunden")
+    end
+
+    print(TAG .. "========== FULL SCAN END ==========")
+end
+
+-- =========================
 -- Main pass
 -- =========================
 local function patch_pass(debugLeft)
@@ -566,6 +772,7 @@ LoopAsync(1000, function()
         tries = 0
         didSettings = false
         unmatchedLogged = false
+        fullScanDone = false
         print(TAG .. "map: " .. mapname)
     end
 
@@ -577,6 +784,12 @@ LoopAsync(1000, function()
 
     if tries < CFG.START_DELAY_PASSES then
         return false
+    end
+
+    -- Debug: vollständiger Scan (einmal pro Map, im ersten Pass)
+    if not fullScanDone then
+        debug_full_scan()
+        fullScanDone = true
     end
 
     -- Settings einmal pro Map (optional)
