@@ -11,6 +11,10 @@ local CFG = {
     PATCH_RUNTIME_NODES     = false,      -- DEAKTIVIERT: bRichNode etc. existieren NICHT auf AResourceNode (nur in SavedResourceNode)
     PATCH_RUNTIME_WILDLIFE  = true,       -- ASMUnit Wildlife: Breeding beschleunigen
 
+    -- Fruchtbarkeit: Grid auf Maximum setzen (Getreide braucht keine Fruchtbarkeit)
+    PATCH_FERTILITY         = true,
+    FERTILITY_REFRESH_SEC   = 30,         -- Sekunden zwischen Fruchtbarkeits-Refreshes (0 = nur beim Map-Load)
+
     -- Optional: für Generierung/Spawn (kann je nach UE4SS/Version instabil sein)
     PATCH_RESOURCE_SETTINGS = true,
 
@@ -44,6 +48,11 @@ local WILDLIFE_ROLES = {
     [8]  = "Deer",      -- EUnitRole::Deer (enum index 8)
     [20] = "SmallGame", -- EUnitRole::Hare (enum index 20, = SmallGame im Spiel)
 }
+
+-- ECropType Enum: Getreide-Typen die normalerweise Fruchtbarkeit benötigen
+-- Wheat=1, Flax=2, Barley=3, Rye=7 (aus ECropType.h)
+-- FLinearColor hat 4 Kanäle (RGBA) — Mapping auf Getreidetypen intern im Spiel
+local GRAIN_CROP_TYPES = { 1, 2, 3, 7 }  -- Wheat, Flax, Barley, Rye
 
 -- =========================
 -- Helpers
@@ -446,6 +455,97 @@ local function patch_resource_settings()
 end
 
 -- =========================
+-- Patch: Fruchtbarkeit auf Maximum (Getreide ohne Fertility-Requirement)
+-- RTSMultiEngineCPP.fertilityGrid = TArray<FLinearColor>
+-- Jede Zelle hat 4 Kanäle (RGBA) für die Getreide-Fruchtbarkeit.
+-- Wir setzen alles auf 1.0 (Maximum) => Getreide wächst überall mit vollem Ertrag.
+-- =========================
+local function find_game_engine()
+    local engine = nil
+    local ok = pcall(function() engine = FindFirstOf("RTSMultiEngineCPP") end)
+    if ok and engine and engine.IsValid and engine:IsValid() then return engine end
+    return nil
+end
+
+local function patch_fertility_grid()
+    local engine = find_game_engine()
+    if not engine then return false, "RTSMultiEngineCPP not found" end
+
+    -- Fertility-Grid muss aktiv sein
+    try_set(engine, "enableFertilityGrid", true)
+
+    local grid = try_get(engine, "fertilityGrid")
+    if not grid then return false, "fertilityGrid not accessible" end
+
+    local gridLen = tarray_num(grid)
+    if not gridLen or gridLen <= 0 then
+        return false, "fertilityGrid empty (len=" .. tostring(gridLen) .. ")"
+    end
+
+    local patched = 0
+    local channels = {"R", "G", "B", "A"}
+
+    -- Methode 1: Direkte Struct-Modifikation via GetObjectRef
+    local method1Works = false
+    local testCell = nil
+    pcall(function() testCell = grid:GetObjectRef(0) end)
+    if testCell then
+        local testR = try_get(testCell, "R")
+        if testR ~= nil then method1Works = true end
+    end
+
+    if method1Works then
+        -- fertilityGrid: alle Zellen auf Maximum (1.0 pro Kanal)
+        for i = 0, gridLen - 1 do
+            local cell = nil
+            pcall(function() cell = grid:GetObjectRef(i) end)
+            if cell then
+                local changed = false
+                for _, ch in ipairs(channels) do
+                    local cur = to_num(try_get(cell, ch))
+                    if cur ~= nil and cur < 1.0 then
+                        if try_set(cell, ch, 1.0) then changed = true end
+                    end
+                end
+                if changed then patched = patched + 1 end
+            end
+        end
+
+        -- fertilityGridLimits ebenfalls auf Maximum
+        local limits = try_get(engine, "fertilityGridLimits")
+        if limits then
+            local limLen = tarray_num(limits) or 0
+            for i = 0, limLen - 1 do
+                local cell = nil
+                pcall(function() cell = limits:GetObjectRef(i) end)
+                if cell then
+                    for _, ch in ipairs(channels) do
+                        try_set(cell, ch, 1.0)
+                    end
+                end
+            end
+        end
+    else
+        -- Methode 2 (Fallback): changeFertilityCellUnclamped pro Zelle/CropType
+        -- changeFertilityCellUnclamped(CellID, cropType, change) ist BlueprintCallable
+        for i = 0, gridLen - 1 do
+            for _, cropType in ipairs(GRAIN_CROP_TYPES) do
+                local ok = pcall(function()
+                    engine:changeFertilityCellUnclamped(i, cropType, 999.0)
+                end)
+                if ok then patched = patched + 1 end
+            end
+        end
+    end
+
+    -- Fertility-Overlay aktualisieren
+    pcall(function() engine:redrawFertilityComplete() end)
+
+    return patched > 0, ("method=%s | patched=%d/%d cells"):format(
+        method1Works and "direct" or "changeFertility", patched, gridLen)
+end
+
+-- =========================
 -- Diagnose: nicht erkannte Aktoren loggen (einmal pro Map)
 -- =========================
 local unmatchedLogged = false
@@ -719,6 +819,49 @@ local function debug_full_scan()
         print(TAG .. "  ResourceSettings NICHT gefunden")
     end
 
+    -- 6) Fertility Grid Diagnose
+    print(TAG .. "--- Fertility Grid ---")
+    local engine = find_game_engine()
+    if engine then
+        local fertEnabled = try_get(engine, "enableFertilityGrid")
+        print(TAG .. "  enableFertilityGrid: " .. tostring(fertEnabled))
+
+        local grid = try_get(engine, "fertilityGrid")
+        local limits = try_get(engine, "fertilityGridLimits")
+        local gridLen = grid and tarray_num(grid) or 0
+        local limitsLen = limits and tarray_num(limits) or 0
+        print(TAG .. "  fertilityGrid entries: " .. tostring(gridLen))
+        print(TAG .. "  fertilityGridLimits entries: " .. tostring(limitsLen))
+
+        -- Erste 5 Zellen als Beispiel anzeigen
+        if grid and gridLen and gridLen > 0 then
+            local sampleCount = math.min(5, gridLen)
+            for i = 0, sampleCount - 1 do
+                local cell = nil
+                pcall(function() cell = grid:GetObjectRef(i) end)
+                if cell then
+                    local r = tostring(try_get(cell, "R") or "?")
+                    local g = tostring(try_get(cell, "G") or "?")
+                    local b = tostring(try_get(cell, "B") or "?")
+                    local a = tostring(try_get(cell, "A") or "?")
+                    print(TAG .. ("  grid[%d] R=%s G=%s B=%s A=%s"):format(i, r, g, b, a))
+                else
+                    -- Fallback: direkte Indizierung
+                    local ok, v = pcall(function() return grid[i] end)
+                    print(TAG .. ("  grid[%d] GetObjectRef=nil | direct=%s"):format(i, tostring(v)))
+                end
+            end
+
+            -- Zugriffsmethoden testen
+            local m1 = pcall(function() return grid:GetObjectRef(0) end) and "ja" or "nein"
+            local m2 = pcall(function() return grid:Get(0) end) and "ja" or "nein"
+            local m3 = pcall(function() return grid[0] end) and "ja" or "nein"
+            print(TAG .. "  Zugriff: GetObjectRef=" .. m1 .. " | Get=" .. m2 .. " | [0]=" .. m3)
+        end
+    else
+        print(TAG .. "  RTSMultiEngineCPP NICHT gefunden")
+    end
+
     print(TAG .. "========== FULL SCAN END ==========")
 end
 
@@ -843,6 +986,7 @@ end
 local tries = 0
 local lastMap = ""
 local didSettings = false
+local didFertility = false
 
 LoopAsync(1000, function()
     local world = UEHelpers.GetWorld()
@@ -855,6 +999,7 @@ LoopAsync(1000, function()
         lastMap = mapname
         tries = 0
         didSettings = false
+        didFertility = false
         unmatchedLogged = false
         fullScanDone = false
         print(TAG .. "map: " .. mapname)
@@ -887,6 +1032,17 @@ LoopAsync(1000, function()
         didSettings = true
     end
 
+    -- Fruchtbarkeit einmal pro Map auf Maximum setzen
+    if CFG.PATCH_FERTILITY and not didFertility then
+        local ok, msg = patch_fertility_grid()
+        if ok then
+            print(TAG .. "Fertility grid patched: " .. msg)
+        else
+            print(TAG .. "Fertility patch skipped: " .. tostring(msg))
+        end
+        didFertility = true
+    end
+
     local dbg = { value = CFG.DEBUG_SAMPLES }
     local patched, total = patch_pass(dbg)
 
@@ -899,3 +1055,37 @@ LoopAsync(1000, function()
 
     return false
 end)
+
+-- =========================
+-- Periodischer Fertility-Refresh
+-- Das Spiel verbraucht Fruchtbarkeit beim Anbau.
+-- Dieser Loop setzt sie regelmäßig wieder auf Maximum.
+-- =========================
+if CFG.PATCH_FERTILITY and CFG.FERTILITY_REFRESH_SEC > 0 then
+    local fertRefreshMap = ""
+    LoopAsync(CFG.FERTILITY_REFRESH_SEC * 1000, function()
+        local world = UEHelpers.GetWorld()
+        if not world or not world.IsValid or not world:IsValid() then
+            return false
+        end
+
+        local mapname = get_map_name(world)
+        if not is_gameplay_map(mapname) then
+            return false
+        end
+
+        -- Map-Wechsel tracken (nur loggen)
+        if mapname ~= fertRefreshMap then
+            fertRefreshMap = mapname
+            print(TAG .. "Fertility refresh active for map: " .. mapname)
+        end
+
+        local ok, msg = patch_fertility_grid()
+        if ok then
+            print(TAG .. "Fertility refresh: " .. msg)
+        end
+
+        return false  -- läuft endlos weiter
+    end)
+    print(TAG .. "Fertility refresh timer started (every " .. CFG.FERTILITY_REFRESH_SEC .. "s)")
+end
