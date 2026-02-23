@@ -9,6 +9,7 @@ local CFG = {
     PATCH_RUNTIME_RESOURCES = true,       -- AResource (Resource_Stone_C, Resource_Fish_C, ...)
     PATCH_RUNTIME_DEPOSITS  = true,       -- ADepositDecal (Limit + bRichDeposit)
     PATCH_RUNTIME_NODES     = true,       -- ResourceNode/BP_ResourceNode: nur Rich-Flags (optional)
+    PATCH_RUNTIME_WILDLIFE  = true,       -- ASMUnit Wildlife: Breeding beschleunigen
 
     -- Optional: für Generierung/Spawn (kann je nach UE4SS/Version instabil sein)
     PATCH_RESOURCE_SETTINGS = true,
@@ -30,8 +31,16 @@ local TARGETS = {
 
     Fish      = { amount = 999,  rich = false },
     Berries   = { amount = 999,  rich = false },
-    Deer      = { amount = 999,  rich = false }, -- Wild
-    SmallGame = { amount = 999,  rich = false }, -- Wild
+    -- Wildtiere: amount wirkt nur auf ResourceSettings (Spawn-Parameter),
+    -- da Tiere ASMUnit-Aktoren sind, nicht AResource.
+    Deer      = { amount = 999,  rich = false, wildlife = true },
+    SmallGame = { amount = 999,  rich = false, wildlife = true },
+}
+
+-- EUnitRole -> canonical name (für Wildlife-Erkennung)
+local WILDLIFE_ROLES = {
+    [14] = "Deer",      -- EUnitRole::Deer
+    [27] = "SmallGame", -- EUnitRole::Hare (= SmallGame im Spiel)
 }
 
 -- =========================
@@ -267,6 +276,58 @@ local function patch_node_rich_flags(node)
 end
 
 -- =========================
+-- Patch: Wildlife (ASMUnit mit Deer/Hare-Rolle)
+-- Wildtiere sind KEINE AResource-Aktoren — jedes Tier ist ein ASMUnit.
+-- Wir können Breeding beschleunigen (pregnancy) und tote Tiere zählen.
+-- =========================
+local function patch_wildlife_units(debugLeft)
+    local units = FindAllOf("SMUnit")
+    if not units then return 0, 0 end
+
+    local wildCount = 0
+    local patchedCount = 0
+
+    for _, u in ipairs(units) do
+        if u and u.IsValid and u:IsValid() and is_level_instance(u) then
+            -- currentUnitRole ist EUnitRole (uint8)
+            local role = try_get(u, "currentUnitRole")
+            local roleNum = tonumber(tostring(role or ""))
+            local canonical = roleNum and WILDLIFE_ROLES[roleNum]
+
+            if not canonical then
+                -- Fallback: assignedUnitRole
+                role = try_get(u, "assignedUnitRole")
+                roleNum = tonumber(tostring(role or ""))
+                canonical = roleNum and WILDLIFE_ROLES[roleNum]
+            end
+
+            if canonical and TARGETS[canonical] then
+                local isDead = try_get(u, "dead")
+                if isDead ~= true then
+                    wildCount = wildCount + 1
+
+                    -- Breeding beschleunigen: pregnancy hochsetzen (näher am Spawn-Threshold)
+                    local preg = to_num(try_get(u, "pregnancy"))
+                    if preg ~= nil and preg >= 0 and preg < 0.9 then
+                        if try_set(u, "pregnancy", 0.95) then
+                            patchedCount = patchedCount + 1
+                        end
+                    end
+                end
+
+                if debugLeft.value > 0 and patchedCount > 0 then
+                    debugLeft.value = debugLeft.value - 1
+                    print(TAG .. "wildlife breeding boosted: " .. canonical
+                        .. " | role=" .. tostring(roleNum))
+                end
+            end
+        end
+    end
+
+    return patchedCount, wildCount
+end
+
+-- =========================
 -- Optional: ResourceSettings patch (nur wenn stabil)
 -- =========================
 local function find_resource_settings()
@@ -464,9 +525,22 @@ local function patch_pass(debugLeft)
         end
     end
 
+    -- Wildlife: ASMUnit-Tiere (Deer, Hare/SmallGame)
+    local wildPatched = 0
+    local wildAlive = 0
+    if CFG.PATCH_RUNTIME_WILDLIFE then
+        wildPatched, wildAlive = patch_wildlife_units(debugLeft)
+        patched = patched + wildPatched
+    end
+
     -- Diagnose nur im ersten Pass loggen
-    if not unmatchedLogged and (unmatchedRes > 0 or unmatchedDep > 0) then
-        print(TAG .. "DIAGNOSE: " .. unmatchedRes .. " unerkannte Resources, " .. unmatchedDep .. " unerkannte Deposits")
+    if not unmatchedLogged then
+        if unmatchedRes > 0 or unmatchedDep > 0 then
+            print(TAG .. "DIAGNOSE: " .. unmatchedRes .. " unerkannte Resources, " .. unmatchedDep .. " unerkannte Deposits")
+        end
+        if wildAlive > 0 then
+            print(TAG .. "Wildlife: " .. wildAlive .. " lebende Tiere gefunden, " .. wildPatched .. " breeding boosted")
+        end
         unmatchedLogged = true
     end
 
