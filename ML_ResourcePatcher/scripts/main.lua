@@ -8,7 +8,7 @@ local CFG = {
     -- Stabilster Weg: Runtime patchen (existierende Nodes)
     PATCH_RUNTIME_RESOURCES = true,       -- AResource (Resource_Stone_C, Resource_Fish_C, ...)
     PATCH_RUNTIME_DEPOSITS  = true,       -- ADepositDecal (Limit + bRichDeposit)
-    PATCH_RUNTIME_NODES     = true,       -- ResourceNode/BP_ResourceNode: nur Rich-Flags (optional)
+    PATCH_RUNTIME_NODES     = false,      -- DEAKTIVIERT: bRichNode etc. existieren NICHT auf AResourceNode (nur in SavedResourceNode)
     PATCH_RUNTIME_WILDLIFE  = true,       -- ASMUnit Wildlife: Breeding beschleunigen
 
     -- Optional: für Generierung/Spawn (kann je nach UE4SS/Version instabil sein)
@@ -41,8 +41,8 @@ local TARGETS = {
 
 -- EUnitRole -> canonical name (für Wildlife-Erkennung)
 local WILDLIFE_ROLES = {
-    [14] = "Deer",      -- EUnitRole::Deer
-    [27] = "SmallGame", -- EUnitRole::Hare (= SmallGame im Spiel)
+    [8]  = "Deer",      -- EUnitRole::Deer (enum index 8)
+    [20] = "SmallGame", -- EUnitRole::Hare (enum index 20, = SmallGame im Spiel)
 }
 
 -- =========================
@@ -112,9 +112,30 @@ end
 
 local function tarray_get(arr, idx0) -- idx0 = 0-based
     if arr == nil then return nil end
+    -- Method 1: :Get(idx) (UE4SS standard für UObject-Arrays)
     local ok, v = pcall(function() return arr:Get(idx0) end)
-    if ok then return v end
+    if ok and v ~= nil then return v end
+    -- Method 2: [] 1-based (Lua-Konvention, manche UE4SS Versionen)
+    ok, v = pcall(function() return arr[idx0 + 1] end)
+    if ok and v ~= nil then return v end
+    -- Method 3: [] 0-based
+    ok, v = pcall(function() return arr[idx0] end)
+    if ok and v ~= nil then return v end
+    -- Method 4: :GetObjectRef(idx) (für Struct-Arrays)
+    ok, v = pcall(function() return arr:GetObjectRef(idx0) end)
+    if ok and v ~= nil then return v end
     return nil
+end
+
+-- ForEach-Iteration für TArray (Alternative wenn Get/[] nicht funktioniert)
+local function tarray_foreach(arr, fn)
+    if arr == nil then return false end
+    local ok = pcall(function()
+        arr:ForEach(function(idx, elem)
+            fn(idx, elem)
+        end)
+    end)
+    return ok
 end
 
 -- =========================
@@ -349,6 +370,44 @@ local function find_resource_settings()
     return nil
 end
 
+local function patch_settings_entry(entry, patched_count)
+    if entry == nil then return patched_count end
+    local t = canonical_from_name(try_get(entry, "Type"))
+    -- entry.Type ist ENodeType Enum; kann als int (1=Salt...) oder String kommen
+    if t and TARGETS[t] then
+        local props = try_get(entry, "Properties")
+        if props ~= nil then
+            local amt = TARGETS[t].amount
+            local rich = TARGETS[t].rich
+
+            -- normale range
+            try_set(props, "MinResourceAmount", amt)
+            try_set(props, "MaxResourceAmount", amt)
+
+            -- rich range
+            try_set(props, "MinRichResourceAmount", amt)
+            try_set(props, "MaxRichResourceAmount", amt)
+
+            -- resourceCount: wie viele Clumps spawnen
+            try_set(props, "resourceCount", amt)
+
+            -- Mineables: underground deposits when rich
+            if rich then
+                try_set(props, "bIsLimitedResource", true)
+                try_set(props, "bUndergroundDepositsWhenRich", true)
+            end
+
+            -- Tiere: BreedingThreshold niedrig setzen -> schneller vermehren
+            if t == "Deer" or t == "SmallGame" then
+                try_set(props, "BreedingThreshold", 1)
+            end
+
+            patched_count = patched_count + 1
+        end
+    end
+    return patched_count
+end
+
 local function patch_resource_settings()
     local settings = find_resource_settings()
     if not settings then
@@ -367,42 +426,19 @@ local function patch_resource_settings()
 
     local patched = 0
 
+    -- Methode 1: Index-basierte Iteration (tarray_get probiert mehrere Zugriffsmethoden)
     for i0 = 0, len - 1 do
         local entry = tarray_get(data, i0)
-        if entry ~= nil then
-            local t = canonical_from_name(try_get(entry, "Type"))
-            -- entry.Type ist ENodeType Enum; kann als int (1=Salt...) oder String kommen
-            if t and TARGETS[t] then
-                local props = try_get(entry, "Properties")
-                if props ~= nil then
-                    local amt = TARGETS[t].amount
-                    local rich = TARGETS[t].rich
+        patched = patch_settings_entry(entry, patched)
+    end
 
-                    -- normale range
-                    try_set(props, "MinResourceAmount", amt)
-                    try_set(props, "MaxResourceAmount", amt)
-
-                    -- rich range
-                    try_set(props, "MinRichResourceAmount", amt)
-                    try_set(props, "MaxRichResourceAmount", amt)
-
-                    -- resourceCount: wie viele Clumps spawnen
-                    try_set(props, "resourceCount", amt)
-
-                    -- Mineables: underground deposits when rich
-                    if rich then
-                        try_set(props, "bIsLimitedResource", true)
-                        try_set(props, "bUndergroundDepositsWhenRich", true)
-                    end
-
-                    -- Tiere: BreedingThreshold niedrig setzen -> schneller vermehren
-                    if t == "Deer" or t == "SmallGame" then
-                        try_set(props, "BreedingThreshold", 1)
-                    end
-
-                    patched = patched + 1
-                end
-            end
+    -- Methode 2: ForEach als Fallback (für Struct-Arrays in neueren UE4SS Versionen)
+    if patched == 0 then
+        local forEachWorked = tarray_foreach(data, function(idx, elem)
+            patched = patch_settings_entry(elem, patched)
+        end)
+        if forEachWorked and patched > 0 then
+            print(TAG .. "ResourceSettings: ForEach-Methode hat funktioniert!")
         end
     end
 
@@ -478,37 +514,39 @@ local function debug_full_scan()
         print(TAG .. "  FindAllOf('Resource') returned nil")
     end
 
-    -- 2) ADepositDecal Aktoren
+    -- 2) ADepositDecal Aktoren (mehrere Klassennamen probieren)
     print(TAG .. "--- ADepositDecal Aktoren ---")
-    local deposits = FindAllOf("DepositDecal")
-    if deposits then
-        local count = 0
-        for _, a in ipairs(deposits) do
-            if a and a.IsValid and a:IsValid() and is_level_instance(a) then
-                count = count + 1
-                local depType = tostring(try_get(a, "depositType") or "?")
-                local limit   = tostring(try_get(a, "Limit") or "?")
-                local rich    = tostring(try_get(a, "bRichDeposit") or "?")
-                local cls = "?"
-                pcall(function() cls = tostring(a:GetClass():GetFName():ToString()) end)
-                -- depositedGood.Type auslesen
-                local goodType = "?"
-                local good = try_get(a, "depositedGood")
-                if good then
-                    goodType = tostring(try_get(good, "Type") or "?")
+    for _, depositClassName in ipairs({"DepositDecal", "BP_DepositDecal_C", "DepositDecalCPP"}) do
+        local deposits = nil
+        pcall(function() deposits = FindAllOf(depositClassName) end)
+        if deposits then
+            local count = 0
+            for _, a in ipairs(deposits) do
+                if a and a.IsValid and a:IsValid() and is_level_instance(a) then
+                    count = count + 1
+                    local depType = tostring(try_get(a, "depositType") or "?")
+                    local limit   = tostring(try_get(a, "Limit") or "?")
+                    local rich    = tostring(try_get(a, "bRichDeposit") or "?")
+                    local cls = "?"
+                    pcall(function() cls = tostring(a:GetClass():GetFName():ToString()) end)
+                    local goodType = "?"
+                    local good = try_get(a, "depositedGood")
+                    if good then
+                        goodType = tostring(try_get(good, "Type") or "?")
+                    end
+                    local matched = canonical_from_depositType(try_get(a, "depositType"))
+                    if not matched and good then
+                        matched = canonical_from_name(try_get(good, "Type"))
+                    end
+                    matched = matched or "NO_MATCH"
+                    print(TAG .. ("  [%d] source=%s | class=%s | depositType=%s | goodType=%s | Limit=%s | bRichDeposit=%s | => %s")
+                        :format(count, depositClassName, cls, depType, goodType, limit, rich, matched))
                 end
-                local matched = canonical_from_depositType(try_get(a, "depositType"))
-                if not matched and good then
-                    matched = canonical_from_name(try_get(good, "Type"))
-                end
-                matched = matched or "NO_MATCH"
-                print(TAG .. ("  [%d] class=%s | depositType=%s | goodType=%s | Limit=%s | bRichDeposit=%s | => %s")
-                    :format(count, cls, depType, goodType, limit, rich, matched))
             end
+            print(TAG .. "  " .. depositClassName .. " total (level instances): " .. count)
+        else
+            print(TAG .. "  FindAllOf('" .. depositClassName .. "') returned nil")
         end
-        print(TAG .. "  ADepositDecal total (level instances): " .. count)
-    else
-        print(TAG .. "  FindAllOf('DepositDecal') returned nil")
     end
 
     -- 3) ResourceNode Aktoren
@@ -592,47 +630,89 @@ local function debug_full_scan()
             print(TAG .. ("  Wildlife-Zusammenfassung: %s => alive=%d, dead=%d"):format(name, s.alive, s.dead))
         end
         if wildCount == 0 then
-            -- Dann die ersten 10 Units mit ihren Rollen loggen um zu sehen welche Rollen es gibt
-            print(TAG .. "  KEINE Wildlife erkannt! Erste 10 SMUnit-Rollen:")
+            -- Alle unique Rollen sammeln und die ersten 10 Units loggen
+            print(TAG .. "  KEINE Wildlife erkannt (erwarte Deer=8, Hare=20)! Erste 10 SMUnit-Rollen:")
             local shown = 0
+            local allRoles = {}
             for _, u in ipairs(units) do
-                if u and u.IsValid and u:IsValid() and is_level_instance(u) and shown < 10 then
-                    shown = shown + 1
-                    local curRole = tostring(try_get(u, "currentUnitRole") or "?")
-                    local assignedRole = tostring(try_get(u, "assignedUnitRole") or "?")
-                    local cls = "?"
-                    pcall(function() cls = tostring(u:GetClass():GetFName():ToString()) end)
-                    print(TAG .. ("  [%d] class=%s | currentUnitRole=%s | assignedUnitRole=%s")
-                        :format(shown, cls, curRole, assignedRole))
+                if u and u.IsValid and u:IsValid() and is_level_instance(u) then
+                    local curRole = tonumber(tostring(try_get(u, "currentUnitRole") or ""))
+                    if curRole then allRoles[curRole] = (allRoles[curRole] or 0) + 1 end
+                    if shown < 10 then
+                        shown = shown + 1
+                        local cls = "?"
+                        pcall(function() cls = tostring(u:GetClass():GetFName():ToString()) end)
+                        print(TAG .. ("  [%d] class=%s | currentUnitRole=%s | assignedUnitRole=%s")
+                            :format(shown, cls, tostring(curRole or "?"),
+                                tostring(try_get(u, "assignedUnitRole") or "?")))
+                    end
                 end
             end
+            -- Rollen-Zusammenfassung
+            local roleSumParts = {}
+            for r, c in pairs(allRoles) do
+                roleSumParts[#roleSumParts+1] = ("role%d=%d"):format(r, c)
+            end
+            print(TAG .. "  Alle Rollen: " .. table.concat(roleSumParts, ", "))
         end
         print(TAG .. "  SMUnit total=" .. totalUnits .. " | wildlife erkannt=" .. wildCount)
     else
         print(TAG .. "  FindAllOf('SMUnit') returned nil")
     end
 
-    -- 5) ResourceSettings dump
+    -- 5) ResourceSettings dump (mit TArray-Zugriffsdiagnose)
     print(TAG .. "--- ResourceSettings ---")
     local settings = find_resource_settings()
     if settings then
         local data = try_get(settings, "ResourceNodeData")
         local len = data and tarray_num(data) or 0
         print(TAG .. "  ResourceNodeData entries: " .. tostring(len))
-        if len and len > 0 then
+        print(TAG .. "  ResourceNodeData type: " .. type(data) .. " | tostring: " .. tostring(data))
+
+        -- Diagnose: welche TArray-Zugriffsmethoden funktionieren?
+        if data and len and len > 0 then
+            local method1 = pcall(function() return data:Get(0) end) and "ja" or "nein"
+            local method2 = pcall(function() return data[1] end) and "ja" or "nein"
+            local method3 = pcall(function() return data[0] end) and "ja" or "nein"
+            local method4 = pcall(function() return data:GetObjectRef(0) end) and "ja" or "nein"
+            local method5 = "nein"
+            pcall(function()
+                data:ForEach(function(idx, elem) method5 = "ja" end)
+            end)
+            print(TAG .. "  TArray-Zugriff: Get=" .. method1
+                .. " | [1]=" .. method2
+                .. " | [0]=" .. method3
+                .. " | GetObjectRef=" .. method4
+                .. " | ForEach=" .. method5)
+
+            -- Index-basierter Zugriff
+            local foundEntries = false
             for i0 = 0, len - 1 do
                 local entry = tarray_get(data, i0)
                 if entry then
+                    foundEntries = true
                     local entryType = tostring(try_get(entry, "Type") or "?")
                     local canonical = canonical_from_name(try_get(entry, "Type")) or "NO_MATCH"
                     local props = try_get(entry, "Properties")
                     local minAmt = props and tostring(try_get(props, "MinResourceAmount") or "?") or "?"
                     local maxAmt = props and tostring(try_get(props, "MaxResourceAmount") or "?") or "?"
-                    local minRich = props and tostring(try_get(props, "MinRichResourceAmount") or "?") or "?"
-                    local maxRich = props and tostring(try_get(props, "MaxRichResourceAmount") or "?") or "?"
-                    print(TAG .. ("  [%d] Type=%s | => %s | MinAmt=%s | MaxAmt=%s | MinRich=%s | MaxRich=%s")
-                        :format(i0, entryType, canonical, minAmt, maxAmt, minRich, maxRich))
+                    print(TAG .. ("  [%d] Type=%s | => %s | MinAmt=%s | MaxAmt=%s | props=%s")
+                        :format(i0, entryType, canonical, minAmt, maxAmt, tostring(props)))
                 end
+            end
+
+            -- ForEach als Fallback
+            if not foundEntries then
+                print(TAG .. "  Index-Zugriff fehlgeschlagen, versuche ForEach...")
+                tarray_foreach(data, function(idx, elem)
+                    if elem then
+                        local entryType = tostring(try_get(elem, "Type") or "?")
+                        local canonical = canonical_from_name(try_get(elem, "Type")) or "NO_MATCH"
+                        local props = try_get(elem, "Properties")
+                        print(TAG .. ("  [ForEach %d] Type=%s | => %s | props=%s | elemType=%s")
+                            :format(idx, entryType, canonical, tostring(props), type(elem)))
+                    end
+                end)
             end
         end
     else
@@ -675,21 +755,25 @@ local function patch_pass(debugLeft)
     end
 
     if CFG.PATCH_RUNTIME_DEPOSITS then
-        local deposits = FindAllOf("DepositDecal")
-        if deposits then
-            for _, a in ipairs(deposits) do
-                if a and a.IsValid and a:IsValid() and is_level_instance(a) then
-                    total = total + 1
-                    if patch_deposit_decal(a) then
-                        patched = patched + 1
-                        if debugLeft.value > 0 then
-                            debugLeft.value = debugLeft.value - 1
-                            print(TAG .. "patched DepositDecal: " .. tostring(a:GetFullName()))
-                        end
-                    elseif not unmatchedLogged then
-                        unmatchedDep = unmatchedDep + 1
-                        if unmatchedDep <= 5 then
-                            log_unmatched_deposit(a)
+        -- Mehrere Klassennamen probieren (Basis + BP-Subklassen)
+        for _, depositClass in ipairs({"DepositDecal", "BP_DepositDecal_C", "DepositDecalCPP"}) do
+            local deposits = nil
+            pcall(function() deposits = FindAllOf(depositClass) end)
+            if deposits then
+                for _, a in ipairs(deposits) do
+                    if a and a.IsValid and a:IsValid() and is_level_instance(a) then
+                        total = total + 1
+                        if patch_deposit_decal(a) then
+                            patched = patched + 1
+                            if debugLeft.value > 0 then
+                                debugLeft.value = debugLeft.value - 1
+                                print(TAG .. "patched " .. depositClass .. ": " .. tostring(a:GetFullName()))
+                            end
+                        elseif not unmatchedLogged then
+                            unmatchedDep = unmatchedDep + 1
+                            if unmatchedDep <= 5 then
+                                log_unmatched_deposit(a)
+                            end
                         end
                     end
                 end
