@@ -9,6 +9,7 @@ local CFG = {
     PATCH_RUNTIME_RESOURCES = true,       -- AResource (Resource_Stone_C, Resource_Fish_C, ...)
     PATCH_RUNTIME_DEPOSITS  = true,       -- ADepositDecal (Limit + bRichDeposit)
     PATCH_RUNTIME_NODES     = true,       -- ResourceNode/BP_ResourceNode: nur Rich-Flags (optional)
+    PATCH_RUNTIME_WILDLIFE  = true,       -- ASMUnit Wildlife: Breeding beschleunigen
 
     -- Optional: für Generierung/Spawn (kann je nach UE4SS/Version instabil sein)
     PATCH_RESOURCE_SETTINGS = true,
@@ -16,6 +17,7 @@ local CFG = {
     PASSES = 10,          -- wie viele Sekunden nach Map-Load patchen (Streaming)
     START_DELAY_PASSES = 2, -- erst ab Pass X anfangen (reduziert Race/CTD-Risiko)
     DEBUG_SAMPLES = 12,
+    DEBUG_UNMATCHED = true,  -- zeigt nicht erkannte Ressourcen/Deposits (Diagnose)
 }
 
 -- =========================
@@ -29,8 +31,16 @@ local TARGETS = {
 
     Fish      = { amount = 999,  rich = false },
     Berries   = { amount = 999,  rich = false },
-    Deer      = { amount = 999,  rich = false }, -- Wild
-    SmallGame = { amount = 999,  rich = false }, -- Wild
+    -- Wildtiere: amount wirkt nur auf ResourceSettings (Spawn-Parameter),
+    -- da Tiere ASMUnit-Aktoren sind, nicht AResource.
+    Deer      = { amount = 999,  rich = false, wildlife = true },
+    SmallGame = { amount = 999,  rich = false, wildlife = true },
+}
+
+-- EUnitRole -> canonical name (für Wildlife-Erkennung)
+local WILDLIFE_ROLES = {
+    [14] = "Deer",      -- EUnitRole::Deer
+    [27] = "SmallGame", -- EUnitRole::Hare (= SmallGame im Spiel)
 }
 
 -- =========================
@@ -118,19 +128,36 @@ local ENODE_INT_TO_NAME = {
     [5] = "Fish", [6] = "Berries", [7] = "Stone", [10] = "SmallGame",
 }
 
+-- EItemType enum (uint32): Fallback falls AResource.Type EItemType statt ENodeType ist
+-- Werte aus EItemType.h (gezählt ab expliziten Werten)
+local EITEM_INT_TO_NAME = {
+    [14]  = "Iron",       -- IronOre
+    [27]  = "Stone",      -- RoughStone
+    [30]  = "Fish",       -- fish
+    [36]  = "Deer",       -- deer_stag
+    [145] = "Salt",       -- Salt
+    [146] = "Clay",       -- Clay
+    [171] = "Berries",    -- Berries
+    [283] = "Stone",      -- DressedStone
+    [330] = "SmallGame",  -- SmallGame
+}
+
 local function canonical_from_name(name)
     local s = safe_lower(tostring(name))
-    -- try integer enum value first
+    -- try integer enum value first (ENodeType, then EItemType)
     local n = tonumber(s)
-    if n ~= nil then return ENODE_INT_TO_NAME[n] end
+    if n ~= nil then
+        if ENODE_INT_TO_NAME[n] then return ENODE_INT_TO_NAME[n] end
+        if EITEM_INT_TO_NAME[n] then return EITEM_INT_TO_NAME[n] end
+    end
     -- substring matching for FName / class name strings
     if s:find("stone", 1, true) then return "Stone" end
     if s:find("clay", 1, true) then return "Clay" end
     if s:find("salt", 1, true) then return "Salt" end
     if s:find("iron", 1, true) or s:find("ore", 1, true) then return "Iron" end
     if s:find("fish", 1, true) then return "Fish" end
-    if s:find("berries", 1, true) then return "Berries" end
-    if s:find("deer", 1, true) then return "Deer" end
+    if s:find("berries", 1, true) or s:find("berry", 1, true) then return "Berries" end
+    if s:find("deer", 1, true) or s:find("stag", 1, true) then return "Deer" end
     if s:find("smallgame", 1, true) or s:find("small_game", 1, true) then return "SmallGame" end
     return nil
 end
@@ -144,15 +171,25 @@ end
 -- Patch: AResource (Runtime)
 -- =========================
 local function patch_resource_actor(a)
-    -- AResource: resType (FName), amt, capacity
+    -- AResource: resType (FName), Type (int32 ENodeType), amt, capacity
     local t = canonical_from_name(try_get(a, "resType"))
     if not t then
+        -- fallback: Type property (ENodeType enum as int32)
+        t = canonical_from_name(try_get(a, "Type"))
+    end
+    if not t then
+        -- fallback: DisplayName
+        t = canonical_from_name(try_get(a, "DisplayName"))
+    end
+    if not t then
         -- fallback: Classname
-        local cls = safe_lower(a:GetClass():GetFullName())
-        for k, _ in pairs(TARGETS) do
-            if cls:find("resource_" .. safe_lower(k), 1, true) then
-                t = k
-                break
+        local ok, cls = pcall(function() return safe_lower(a:GetClass():GetFullName()) end)
+        if ok and cls then
+            for k, _ in pairs(TARGETS) do
+                if cls:find("resource_" .. safe_lower(k), 1, true) then
+                    t = k
+                    break
+                end
             end
         end
     end
@@ -182,6 +219,13 @@ end
 -- =========================
 local function patch_deposit_decal(a)
     local t = canonical_from_depositType(try_get(a, "depositType"))
+    if not t then
+        -- fallback: depositedGood.Type (EItemType int32)
+        local good = try_get(a, "depositedGood")
+        if good then
+            t = canonical_from_name(try_get(good, "Type"))
+        end
+    end
     if not t or not TARGETS[t] then return false end
 
     local amt = TARGETS[t].amount
@@ -229,6 +273,58 @@ local function patch_node_rich_flags(node)
     end
 
     return changed
+end
+
+-- =========================
+-- Patch: Wildlife (ASMUnit mit Deer/Hare-Rolle)
+-- Wildtiere sind KEINE AResource-Aktoren — jedes Tier ist ein ASMUnit.
+-- Wir können Breeding beschleunigen (pregnancy) und tote Tiere zählen.
+-- =========================
+local function patch_wildlife_units(debugLeft)
+    local units = FindAllOf("SMUnit")
+    if not units then return 0, 0 end
+
+    local wildCount = 0
+    local patchedCount = 0
+
+    for _, u in ipairs(units) do
+        if u and u.IsValid and u:IsValid() and is_level_instance(u) then
+            -- currentUnitRole ist EUnitRole (uint8)
+            local role = try_get(u, "currentUnitRole")
+            local roleNum = tonumber(tostring(role or ""))
+            local canonical = roleNum and WILDLIFE_ROLES[roleNum]
+
+            if not canonical then
+                -- Fallback: assignedUnitRole
+                role = try_get(u, "assignedUnitRole")
+                roleNum = tonumber(tostring(role or ""))
+                canonical = roleNum and WILDLIFE_ROLES[roleNum]
+            end
+
+            if canonical and TARGETS[canonical] then
+                local isDead = try_get(u, "dead")
+                if isDead ~= true then
+                    wildCount = wildCount + 1
+
+                    -- Breeding beschleunigen: pregnancy hochsetzen (näher am Spawn-Threshold)
+                    local preg = to_num(try_get(u, "pregnancy"))
+                    if preg ~= nil and preg >= 0 and preg < 0.9 then
+                        if try_set(u, "pregnancy", 0.95) then
+                            patchedCount = patchedCount + 1
+                        end
+                    end
+                end
+
+                if debugLeft.value > 0 and patchedCount > 0 then
+                    debugLeft.value = debugLeft.value - 1
+                    print(TAG .. "wildlife breeding boosted: " .. canonical
+                        .. " | role=" .. tostring(roleNum))
+                end
+            end
+        end
+    end
+
+    return patchedCount, wildCount
 end
 
 -- =========================
@@ -310,11 +406,44 @@ local function patch_resource_settings()
 end
 
 -- =========================
+-- Diagnose: nicht erkannte Aktoren loggen (einmal pro Map)
+-- =========================
+local unmatchedLogged = false
+
+local function log_unmatched_resource(a)
+    if not CFG.DEBUG_UNMATCHED then return end
+    local resType = tostring(try_get(a, "resType") or "nil")
+    local typeInt = tostring(try_get(a, "Type") or "nil")
+    local dispName = tostring(try_get(a, "DisplayName") or "nil")
+    local cls = ""
+    pcall(function() cls = tostring(a:GetClass():GetFullName()) end)
+    print(TAG .. "UNMATCHED Resource | resType=" .. resType
+        .. " | Type=" .. typeInt
+        .. " | DisplayName=" .. dispName
+        .. " | class=" .. cls)
+end
+
+local function log_unmatched_deposit(a)
+    if not CFG.DEBUG_UNMATCHED then return end
+    local depType = tostring(try_get(a, "depositType") or "nil")
+    local limit = tostring(try_get(a, "Limit") or "nil")
+    local rich = tostring(try_get(a, "bRichDeposit") or "nil")
+    local cls = ""
+    pcall(function() cls = tostring(a:GetClass():GetFullName()) end)
+    print(TAG .. "UNMATCHED Deposit | depositType=" .. depType
+        .. " | Limit=" .. limit
+        .. " | bRichDeposit=" .. rich
+        .. " | class=" .. cls)
+end
+
+-- =========================
 -- Main pass
 -- =========================
 local function patch_pass(debugLeft)
     local total = 0
     local patched = 0
+    local unmatchedRes = 0
+    local unmatchedDep = 0
 
     if CFG.PATCH_RUNTIME_RESOURCES then
         local resources = FindAllOf("Resource")
@@ -327,6 +456,11 @@ local function patch_pass(debugLeft)
                         if debugLeft.value > 0 then
                             debugLeft.value = debugLeft.value - 1
                             print(TAG .. "patched Resource: " .. tostring(a:GetFullName()))
+                        end
+                    elseif not unmatchedLogged then
+                        unmatchedRes = unmatchedRes + 1
+                        if unmatchedRes <= 5 then
+                            log_unmatched_resource(a)
                         end
                     end
                 end
@@ -345,6 +479,11 @@ local function patch_pass(debugLeft)
                         if debugLeft.value > 0 then
                             debugLeft.value = debugLeft.value - 1
                             print(TAG .. "patched DepositDecal: " .. tostring(a:GetFullName()))
+                        end
+                    elseif not unmatchedLogged then
+                        unmatchedDep = unmatchedDep + 1
+                        if unmatchedDep <= 5 then
+                            log_unmatched_deposit(a)
                         end
                     end
                 end
@@ -386,6 +525,25 @@ local function patch_pass(debugLeft)
         end
     end
 
+    -- Wildlife: ASMUnit-Tiere (Deer, Hare/SmallGame)
+    local wildPatched = 0
+    local wildAlive = 0
+    if CFG.PATCH_RUNTIME_WILDLIFE then
+        wildPatched, wildAlive = patch_wildlife_units(debugLeft)
+        patched = patched + wildPatched
+    end
+
+    -- Diagnose nur im ersten Pass loggen
+    if not unmatchedLogged then
+        if unmatchedRes > 0 or unmatchedDep > 0 then
+            print(TAG .. "DIAGNOSE: " .. unmatchedRes .. " unerkannte Resources, " .. unmatchedDep .. " unerkannte Deposits")
+        end
+        if wildAlive > 0 then
+            print(TAG .. "Wildlife: " .. wildAlive .. " lebende Tiere gefunden, " .. wildPatched .. " breeding boosted")
+        end
+        unmatchedLogged = true
+    end
+
     return patched, total
 end
 
@@ -407,6 +565,7 @@ LoopAsync(1000, function()
         lastMap = mapname
         tries = 0
         didSettings = false
+        unmatchedLogged = false
         print(TAG .. "map: " .. mapname)
     end
 
